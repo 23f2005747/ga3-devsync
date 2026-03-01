@@ -10,13 +10,9 @@ import os
 from dotenv import load_dotenv
 import json
 import re
-import tempfile
-import time
-import yt_dlp
-
-# Gemini
-from google import genai
-from google.genai import types
+import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 load_dotenv()
 
@@ -30,9 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# SENTIMENT (AI PIPE)
-# ----------------------------
+# =========================================================
+# 1️⃣ SENTIMENT (AI PIPE)
+# =========================================================
 
 ai_pipe_client = OpenAI(
     api_key=os.getenv("AI_PIPE_TOKEN"),
@@ -53,18 +49,16 @@ async def analyze_comment(request: CommentRequest):
             ],
             temperature=0
         )
+
         return json.loads(response.choices[0].message.content)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ----------------------------
-# CODE INTERPRETER
-# ----------------------------
-
-# ----------------------------
-# CODE INTERPRETER
-# ----------------------------
+# =========================================================
+# 2️⃣ CODE INTERPRETER
+# =========================================================
 
 class CodeRequest(BaseModel):
     code: str
@@ -86,15 +80,9 @@ def execute_python_code(code: str) -> dict:
 
 
 def extract_exec_line(traceback_text: str) -> List[int]:
-    """
-    Extract ONLY the line number from exec() traceback.
-    Must match: File "<string>", line X
-    """
     match = re.search(r'File "<string>", line (\d+)', traceback_text)
-
     if match:
         return [int(match.group(1))]
-
     return []
 
 
@@ -115,101 +103,117 @@ def code_interpreter(request: CodeRequest):
         "result": execution["output"]
     }
 
-# ----------------------------
-# YOUTUBE AUDIO TIMESTAMP
-# ----------------------------
+
+# =========================================================
+# 3️⃣ YOUTUBE TRANSCRIPT TIMESTAMP FINDER
+# =========================================================
 
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
 
-def download_audio(video_url: str) -> str:
-    temp_dir = tempfile.gettempdir()
-    output_template = os.path.join(temp_dir, "audio.%(ext)s")
+def extract_video_id(url: str) -> str:
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    return match.group(1)
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "quiet": True,
-        "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android"]
-            }
-        }
+
+def seconds_to_hhmmss(seconds: float) -> str:
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def get_transcript_text(video_id: str) -> str:
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
+    formatted = ""
+    for entry in transcript:
+        timestamp = seconds_to_hhmmss(entry["start"])
+        text = entry["text"].replace("\n", " ")
+        formatted += f"[{timestamp}] {text}\n"
+
+    return formatted
+
+
+def ask_gemini_for_timestamp(transcript: str, topic: str) -> str:
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('AI_PIPE_TOKEN')}",
+        "Content-Type": "application/json",
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        ext = info["ext"]
-
-    return os.path.join(temp_dir, f"audio.{ext}")
-
-
-def upload_and_wait(file_path: str):
-    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    uploaded_file = gemini_client.files.upload(file=file_path)
-
-    while True:
-        file_info = gemini_client.files.get(name=uploaded_file.name)
-        if file_info.state.name == "ACTIVE":
-            break
-        time.sleep(3)
-
-    return uploaded_file
-
-
-def ask_gemini(uploaded_file, topic: str) -> str:
-    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
     prompt = f"""
-Analyze this audio file.
+You are a precise timestamp finder.
 
-Find the EXACT FIRST time this phrase is spoken:
+Below is a transcript with timestamps in HH:MM:SS format.
+
+Find the FIRST moment where the speaker discusses:
 
 "{topic}"
 
-Return ONLY JSON:
-{{ "timestamp": "HH:MM:SS" }}
-
 Rules:
-- Return FIRST occurrence
-- Format strictly HH:MM:SS
-- No extra text
+- Return FIRST occurrence only
+- Timestamp must be exactly HH:MM:SS
+- No explanation
+- Return ONLY JSON
+
+Transcript:
+{transcript}
+
+Return ONLY:
+{{ "timestamp": "HH:MM:SS" }}
 """
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[uploaded_file, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "timestamp": types.Schema(type=types.Type.STRING)
-                },
-                required=["timestamp"],
-            ),
-        ),
+    payload = {
+        "model": "google/gemini-2.0-flash-001",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+    }
+
+    response = requests.post(
+        os.getenv("AI_PIPE_BASE_URL") + "/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=60
     )
 
-    result = json.loads(response.text)
-    return result["timestamp"]
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="AI API error")
+
+    raw = response.json()["choices"][0]["message"]["content"].strip()
+
+    # Remove markdown if present
+    if raw.startswith("```"):
+        raw = "\n".join([l for l in raw.split("\n") if not l.startswith("```")]).strip()
+
+    try:
+        result = json.loads(raw)
+        return result.get("timestamp", "00:00:00")
+    except:
+        match = re.search(r"\d{2}:\d{2}:\d{2}", raw)
+        if match:
+            return match.group(0)
+        return "00:00:00"
 
 
 @app.post("/ask")
 def ask(request: AskRequest):
-    temp_file = None
     try:
-        # 1️⃣ Download audio
-        temp_file = download_audio(request.video_url)
+        video_id = extract_video_id(request.video_url)
 
-        # 2️⃣ Upload to Gemini
-        uploaded_file = upload_and_wait(temp_file)
+        transcript_text = get_transcript_text(video_id)
 
-        # 3️⃣ Ask Gemini
-        timestamp = ask_gemini(uploaded_file, request.topic)
+        timestamp = ask_gemini_for_timestamp(
+            transcript_text,
+            request.topic
+        )
 
         return {
             "timestamp": timestamp,
@@ -217,9 +221,9 @@ def ask(request: AskRequest):
             "topic": request.topic
         }
 
+    except TranscriptsDisabled:
+        raise HTTPException(status_code=400, detail="Transcripts disabled")
+    except NoTranscriptFound:
+        raise HTTPException(status_code=400, detail="No transcript found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
