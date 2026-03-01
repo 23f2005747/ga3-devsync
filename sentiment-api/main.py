@@ -248,31 +248,67 @@ Format MUST be exactly HH:MM:SS.
     result = json.loads(response.text)
     return result["timestamp"]
 
+def seconds_to_hhmmss(seconds: float) -> str:
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 @app.post("/ask")
 def ask(request: AskRequest):
-    temp_file = None
-
     try:
-        # 1️⃣ Download audio
-        temp_file = download_audio(request.video_url)
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "vtt",
+            "quiet": True,
+        }
 
-        # 2️⃣ Upload to Gemini
-        uploaded_file = upload_audio_to_gemini(temp_file)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(request.video_url, download=False)
 
-        # 3️⃣ Ask Gemini
-        timestamp = find_timestamp(uploaded_file, request.topic)
+        # Get subtitles
+        subtitles = info.get("automatic_captions") or info.get("subtitles")
 
+        if not subtitles:
+            raise HTTPException(status_code=400, detail="No captions available")
+
+        # Pick English
+        en_subs = subtitles.get("en") or list(subtitles.values())[0]
+
+        # Download subtitle content
+        subtitle_url = en_subs[0]["url"]
+
+        import requests
+        response = requests.get(subtitle_url)
+        vtt_text = response.text
+
+        # Parse VTT
+        lines = vtt_text.split("\n")
+
+        for i in range(len(lines)):
+            if request.topic.lower() in lines[i].lower():
+                # Timestamp is previous line
+                timestamp_line = lines[i-1]
+                start_time = timestamp_line.split(" --> ")[0]
+
+                # Convert HH:MM:SS.mmm to HH:MM:SS
+                hhmmss = start_time.split(".")[0]
+
+                return {
+                    "timestamp": hhmmss,
+                    "video_url": request.video_url,
+                    "topic": request.topic
+                }
+
+        # If not found
         return {
-            "timestamp": timestamp,
+            "timestamp": "00:00:00",
             "video_url": request.video_url,
             "topic": request.topic
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        # 4️⃣ Cleanup
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
