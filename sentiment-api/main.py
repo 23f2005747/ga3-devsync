@@ -9,7 +9,7 @@ load_dotenv()
 
 client = OpenAI(
     api_key=os.getenv("AI_PIPE_TOKEN"),
-    base_url=os.getenv("BASE_URL")
+    base_url=os.getenv("AI_PIPE_BASE_URL")
 )
 
 app = FastAPI()
