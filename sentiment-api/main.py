@@ -12,7 +12,7 @@ import json
 import re
 import tempfile
 import time
-import yt_dlp
+
 
 # Gemini
 from google import genai
@@ -183,70 +183,6 @@ class AskRequest(BaseModel):
     topic: str
 
 
-def download_audio(video_url: str) -> str:
-    temp_dir = tempfile.gettempdir()
-    output_template = os.path.join(temp_dir, "audio.%(ext)s")
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "quiet": True,
-        "noplaylist": True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        ext = info["ext"]
-
-    return os.path.join(temp_dir, f"audio.{ext}")
-
-
-def upload_audio_to_gemini(file_path: str):
-    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    uploaded_file = gemini_client.files.upload(file=file_path)
-
-    # Poll until ACTIVE
-    while True:
-        file_info = gemini_client.files.get(name=uploaded_file.name)
-        if file_info.state.name == "ACTIVE":
-            break
-        time.sleep(2)
-
-    return uploaded_file
-
-
-def find_timestamp(uploaded_file, topic: str) -> str:
-    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[
-            uploaded_file,
-            f"""
-Find the FIRST timestamp where this topic is spoken in the audio.
-
-Topic: {topic}
-
-Return ONLY JSON:
-{{ "timestamp": "HH:MM:SS" }}
-
-Format MUST be exactly HH:MM:SS.
-"""
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "timestamp": types.Schema(type=types.Type.STRING)
-                },
-                required=["timestamp"],
-            ),
-        ),
-    )
-
-    result = json.loads(response.text)
-    return result["timestamp"]
 
 def seconds_to_hhmmss(seconds: float) -> str:
     seconds = int(seconds)
@@ -255,50 +191,51 @@ def seconds_to_hhmmss(seconds: float) -> str:
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+import requests
+import re
+
+def extract_video_id(url: str) -> str:
+    # Handle normal and short URLs
+    patterns = [
+        r"v=([^&]+)",
+        r"youtu\.be/([^?]+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
 @app.post("/ask")
 def ask(request: AskRequest):
     try:
-        ydl_opts = {
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitlesformat": "vtt",
-            "quiet": True,
-        }
+        video_id = extract_video_id(request.video_url)
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(request.video_url, download=False)
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-        # Get subtitles
-        subtitles = info.get("automatic_captions") or info.get("subtitles")
+        transcript_url = f"https://youtubetranscript.com/?server_vid2={video_id}"
 
-        if not subtitles:
-            raise HTTPException(status_code=400, detail="No captions available")
+        response = requests.get(transcript_url, timeout=10)
 
-        # Pick English
-        en_subs = subtitles.get("en") or list(subtitles.values())[0]
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Transcript not available")
 
-        # Download subtitle content
-        subtitle_url = en_subs[0]["url"]
+        transcript = response.json()
 
-        import requests
-        response = requests.get(subtitle_url)
-        vtt_text = response.text
+        for entry in transcript:
+            if request.topic.lower() in entry["text"].lower():
+                seconds = int(entry["start"])
 
-        # Parse VTT
-        lines = vtt_text.split("\n")
+                hours = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                secs = seconds % 60
 
-        for i in range(len(lines)):
-            if request.topic.lower() in lines[i].lower():
-                # Timestamp is previous line
-                timestamp_line = lines[i-1]
-                start_time = timestamp_line.split(" --> ")[0]
-
-                # Convert HH:MM:SS.mmm to HH:MM:SS
-                hhmmss = start_time.split(".")[0]
+                timestamp = f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
                 return {
-                    "timestamp": hhmmss,
+                    "timestamp": timestamp,
                     "video_url": request.video_url,
                     "topic": request.topic
                 }
