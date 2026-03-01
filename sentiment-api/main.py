@@ -182,17 +182,9 @@ class AskRequest(BaseModel):
     video_url: str
     topic: str
 
-
-
-def seconds_to_hhmmss(seconds: float) -> str:
-    seconds = int(seconds)
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
 import requests
 import re
+import xml.etree.ElementTree as ET
 
 
 def extract_video_id(url: str) -> str:
@@ -207,46 +199,63 @@ def extract_video_id(url: str) -> str:
     return None
 
 
+def seconds_to_hhmmss(seconds: float) -> str:
+    seconds = int(float(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 @app.post("/ask")
 def ask(request: AskRequest):
     try:
         video_id = extract_video_id(request.video_url)
 
-        if video_id:
-            transcript_url = f"https://youtubetranscript.com/?server_vid2={video_id}"
+        if not video_id:
+            return {
+                "timestamp": "00:00:00",
+                "video_url": request.video_url,
+                "topic": request.topic
+            }
 
-            response = requests.get(transcript_url, timeout=8)
+        transcript_url = f"https://video.google.com/timedtext?lang=en&v={video_id}"
 
-            if response.status_code == 200:
-                transcript = response.json()
+        response = requests.get(transcript_url, timeout=10)
 
-                for entry in transcript:
-                    if request.topic.lower() in entry["text"].lower():
-                        seconds = int(entry["start"])
+        if response.status_code != 200:
+            return {
+                "timestamp": "00:00:00",
+                "video_url": request.video_url,
+                "topic": request.topic
+            }
 
-                        hours = seconds // 3600
-                        minutes = (seconds % 3600) // 60
-                        secs = seconds % 60
+        root = ET.fromstring(response.text)
 
-                        timestamp = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        topic_lower = request.topic.lower()
 
-                        return {
-                            "timestamp": timestamp,
-                            "video_url": request.video_url,
-                            "topic": request.topic
-                        }
+        for child in root.findall("text"):
+            text_content = child.text or ""
+            if topic_lower in text_content.lower():
+                start_time = child.attrib.get("start", "0")
+                timestamp = seconds_to_hhmmss(start_time)
 
-        # 🔥 Fallback (Never Fail)
+                return {
+                    "timestamp": timestamp,
+                    "video_url": request.video_url,
+                    "topic": request.topic
+                }
+
+        # If not found
         return {
-            "timestamp": "00:05:00",
+            "timestamp": "00:00:00",
             "video_url": request.video_url,
             "topic": request.topic
         }
 
     except Exception:
-        # 🔥 Even if everything crashes, never return 500
         return {
-            "timestamp": "00:05:00",
+            "timestamp": "00:00:00",
             "video_url": request.video_url,
             "topic": request.topic
         }
