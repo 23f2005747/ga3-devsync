@@ -102,12 +102,16 @@ def execute_python_code(code: str) -> dict:
 import re
 
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
-    # 1️⃣ Try extracting from traceback directly
-    match = re.search(r'line (\d+)', tb)
+    # Match ONLY exec code traceback lines
+    match = re.search(r'File "<string>", line (\d+)', tb)
+
+    if not match:
+        match = re.search(r'File "", line (\d+)', tb)
+
     if match:
         return [int(match.group(1))]
 
-    # 2️⃣ If not found, fallback to Gemini
+    # Fallback to Gemini if needed
     try:
         gemini_client = genai.Client(
             api_key=os.getenv("GEMINI_API_KEY")
@@ -149,7 +153,6 @@ Return only JSON:
 
     except Exception:
         return []
-
 
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
