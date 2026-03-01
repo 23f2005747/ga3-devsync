@@ -31,7 +31,7 @@ app.add_middleware(
 )
 
 # ----------------------------
-# AI PIPE (Sentiment Analysis)
+# SENTIMENT (AI PIPE)
 # ----------------------------
 
 ai_pipe_client = OpenAI(
@@ -65,9 +65,6 @@ async def analyze_comment(request: CommentRequest):
 class CodeRequest(BaseModel):
     code: str
 
-class ErrorAnalysis(BaseModel):
-    error_lines: List[int]
-
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
     sys.stdout = StringIO()
@@ -82,16 +79,6 @@ def execute_python_code(code: str) -> dict:
     finally:
         sys.stdout = old_stdout
 
-def analyze_error_with_ai(code: str, tb: str) -> List[int]:
-    match = re.search(r'File "<string>", line (\d+)', tb)
-    if not match:
-        match = re.search(r'File "", line (\d+)', tb)
-
-    if match:
-        return [int(match.group(1))]
-
-    return []
-
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
@@ -99,12 +86,17 @@ def code_interpreter(request: CodeRequest):
     if execution["success"]:
         return {"error": [], "result": execution["output"]}
 
-    error_lines = analyze_error_with_ai(request.code, execution["output"])
-    return {"error": error_lines, "result": execution["output"]}
+    match = re.search(r'line (\d+)', execution["output"])
+    error_line = int(match.group(1)) if match else 1
+
+    return {
+        "error": [error_line],
+        "result": execution["output"]
+    }
 
 
 # ----------------------------
-# YOUTUBE TIMESTAMP FINDER
+# YOUTUBE AUDIO TIMESTAMP
 # ----------------------------
 
 class AskRequest(BaseModel):
@@ -114,35 +106,31 @@ class AskRequest(BaseModel):
 
 def download_audio(video_url: str) -> str:
     temp_dir = tempfile.gettempdir()
-    output_path = os.path.join(temp_dir, "audio.%(ext)s")
+    output_template = os.path.join(temp_dir, "audio.%(ext)s")
 
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": output_path,
+        "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["android"]
             }
-        },
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-        }],
+        }
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
+        ext = info["ext"]
 
-    return os.path.join(temp_dir, "audio.mp3")
+    return os.path.join(temp_dir, f"audio.{ext}")
 
 
-def upload_audio_to_gemini(file_path: str):
+def upload_and_wait(file_path: str):
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     uploaded_file = gemini_client.files.upload(file=file_path)
 
-    # Poll until ACTIVE
     while True:
         file_info = gemini_client.files.get(name=uploaded_file.name)
         if file_info.state.name == "ACTIVE":
@@ -152,13 +140,13 @@ def upload_audio_to_gemini(file_path: str):
     return uploaded_file
 
 
-def find_timestamp(uploaded_file, topic: str) -> str:
+def ask_gemini(uploaded_file, topic: str) -> str:
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     prompt = f"""
-Listen carefully to this audio.
+Analyze this audio file.
 
-Find the EXACT first moment this phrase is spoken:
+Find the EXACT FIRST time this phrase is spoken:
 
 "{topic}"
 
@@ -166,9 +154,9 @@ Return ONLY JSON:
 {{ "timestamp": "HH:MM:SS" }}
 
 Rules:
-- Return the FIRST occurrence
-- Format must be exactly HH:MM:SS
-- No explanation
+- Return FIRST occurrence
+- Format strictly HH:MM:SS
+- No extra text
 """
 
     response = gemini_client.models.generate_content(
@@ -194,14 +182,14 @@ Rules:
 def ask(request: AskRequest):
     temp_file = None
     try:
-        # 1️⃣ Download full audio
+        # 1️⃣ Download audio
         temp_file = download_audio(request.video_url)
 
         # 2️⃣ Upload to Gemini
-        uploaded_file = upload_audio_to_gemini(temp_file)
+        uploaded_file = upload_and_wait(temp_file)
 
         # 3️⃣ Ask Gemini
-        timestamp = find_timestamp(uploaded_file, request.topic)
+        timestamp = ask_gemini(uploaded_file, request.topic)
 
         return {
             "timestamp": timestamp,
