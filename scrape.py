@@ -1,6 +1,6 @@
 from playwright.sync_api import sync_playwright
 
-SEEDS = list(range(88, 98))  # 88 to 97 inclusive
+SEEDS = list(range(9, 19))
 BASE_URL = "https://sanand0.github.io/tdsdata/js_table/?seed={}"
 
 def main():
@@ -14,8 +14,6 @@ def main():
             url = BASE_URL.format(seed)
             print(f"Visiting {url}")
             page.goto(url)
-
-            # Wait for table to render (important for JS page)
             page.wait_for_selector("table")
 
             tables = page.query_selector_all("table")
