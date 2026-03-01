@@ -62,8 +62,13 @@ async def analyze_comment(request: CommentRequest):
 # CODE INTERPRETER
 # ----------------------------
 
+# ----------------------------
+# CODE INTERPRETER
+# ----------------------------
+
 class CodeRequest(BaseModel):
     code: str
+
 
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
@@ -79,21 +84,36 @@ def execute_python_code(code: str) -> dict:
     finally:
         sys.stdout = old_stdout
 
+
+def extract_exec_line(traceback_text: str) -> List[int]:
+    """
+    Extract ONLY the line number from exec() traceback.
+    Must match: File "<string>", line X
+    """
+    match = re.search(r'File "<string>", line (\d+)', traceback_text)
+
+    if match:
+        return [int(match.group(1))]
+
+    return []
+
+
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
 
     if execution["success"]:
-        return {"error": [], "result": execution["output"]}
+        return {
+            "error": [],
+            "result": execution["output"]
+        }
 
-    match = re.search(r'line (\d+)', execution["output"])
-    error_line = int(match.group(1)) if match else 1
+    error_lines = extract_exec_line(execution["output"])
 
     return {
-        "error": [error_line],
+        "error": error_lines,
         "result": execution["output"]
     }
-
 
 # ----------------------------
 # YOUTUBE AUDIO TIMESTAMP
