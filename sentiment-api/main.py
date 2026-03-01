@@ -99,14 +99,21 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = old_stdout
 
 
+import re
+
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
+    # 1️⃣ Try extracting from traceback directly
+    match = re.search(r'line (\d+)', tb)
+    if match:
+        return [int(match.group(1))]
+
+    # 2️⃣ If not found, fallback to Gemini
     try:
         gemini_client = genai.Client(
             api_key=os.getenv("GEMINI_API_KEY")
         )
 
         prompt = f"""
-Analyze this Python code and its error traceback.
 Identify the exact line number(s) where the error occurred.
 
 CODE:
@@ -115,7 +122,7 @@ CODE:
 TRACEBACK:
 {tb}
 
-Return only JSON like:
+Return only JSON:
 {{ "error_lines": [line_numbers] }}
 """
 
@@ -141,7 +148,6 @@ Return only JSON like:
         return result.error_lines
 
     except Exception:
-        # fallback if AI fails
         return []
 
 
