@@ -9,6 +9,10 @@ import traceback
 import os
 from dotenv import load_dotenv
 import json
+import re
+import tempfile
+import time
+import yt_dlp
 
 # Gemini
 from google import genai
@@ -17,13 +21,8 @@ from google.genai import types
 load_dotenv()
 
 # ----------------------------
-# AI PIPE (Sentiment Analysis)
+# APP + CORS
 # ----------------------------
-
-client = OpenAI(
-    api_key=os.getenv("AI_PIPE_TOKEN"),
-    base_url=os.getenv("AI_PIPE_BASE_URL")
-)
 
 app = FastAPI()
 
@@ -36,7 +35,16 @@ app.add_middleware(
 )
 
 # ----------------------------
-# SENTIMENT ENDPOINT
+# AI PIPE (Sentiment Analysis)
+# ----------------------------
+
+ai_pipe_client = OpenAI(
+    api_key=os.getenv("AI_PIPE_TOKEN"),
+    base_url=os.getenv("AI_PIPE_BASE_URL")
+)
+
+# ----------------------------
+# 1️⃣ SENTIMENT ENDPOINT
 # ----------------------------
 
 class CommentRequest(BaseModel):
@@ -46,12 +54,12 @@ class CommentRequest(BaseModel):
 @app.post("/comment")
 async def analyze_comment(request: CommentRequest):
     try:
-        response = client.chat.completions.create(
+        response = ai_pipe_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a sentiment analysis system. Return ONLY valid JSON with fields: sentiment (positive, negative, neutral) and rating (1-5)."
+                    "content": "Return ONLY valid JSON with fields: sentiment (positive, negative, neutral) and rating (1-5)."
                 },
                 {
                     "role": "user",
@@ -61,9 +69,7 @@ async def analyze_comment(request: CommentRequest):
             temperature=0
         )
 
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
-
+        parsed = json.loads(response.choices[0].message.content)
         return parsed
 
     except Exception as e:
@@ -71,7 +77,7 @@ async def analyze_comment(request: CommentRequest):
 
 
 # ----------------------------
-# CODE INTERPRETER SECTION
+# 2️⃣ CODE INTERPRETER
 # ----------------------------
 
 class CodeRequest(BaseModel):
@@ -99,23 +105,18 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = old_stdout
 
 
-import re
-
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
-    # Match ONLY exec code traceback lines
+    # 🔥 First: deterministic extraction from traceback
     match = re.search(r'File "<string>", line (\d+)', tb)
-
     if not match:
         match = re.search(r'File "", line (\d+)', tb)
 
     if match:
         return [int(match.group(1))]
 
-    # Fallback to Gemini if needed
+    # Fallback to Gemini
     try:
-        gemini_client = genai.Client(
-            api_key=os.getenv("GEMINI_API_KEY")
-        )
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
         prompt = f"""
 Identify the exact line number(s) where the error occurred.
@@ -154,6 +155,7 @@ Return only JSON:
     except Exception:
         return []
 
+
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
@@ -164,13 +166,113 @@ def code_interpreter(request: CodeRequest):
             "result": execution["output"]
         }
 
-    else:
-        error_lines = analyze_error_with_ai(
-            request.code,
-            execution["output"]
-        )
+    error_lines = analyze_error_with_ai(request.code, execution["output"])
+
+    return {
+        "error": error_lines,
+        "result": execution["output"]
+    }
+
+
+# ----------------------------
+# 3️⃣ YOUTUBE TIMESTAMP FINDER
+# ----------------------------
+
+class AskRequest(BaseModel):
+    video_url: str
+    topic: str
+
+
+def download_audio(video_url: str) -> str:
+    temp_dir = tempfile.gettempdir()
+    output_template = os.path.join(temp_dir, "audio.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "noplaylist": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        ext = info["ext"]
+
+    return os.path.join(temp_dir, f"audio.{ext}")
+
+
+def upload_audio_to_gemini(file_path: str):
+    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    uploaded_file = gemini_client.files.upload(file=file_path)
+
+    # Poll until ACTIVE
+    while True:
+        file_info = gemini_client.files.get(name=uploaded_file.name)
+        if file_info.state.name == "ACTIVE":
+            break
+        time.sleep(2)
+
+    return uploaded_file
+
+
+def find_timestamp(uploaded_file, topic: str) -> str:
+    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+    response = gemini_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[
+            uploaded_file,
+            f"""
+Find the FIRST timestamp where this topic is spoken in the audio.
+
+Topic: {topic}
+
+Return ONLY JSON:
+{{ "timestamp": "HH:MM:SS" }}
+
+Format MUST be exactly HH:MM:SS.
+"""
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "timestamp": types.Schema(type=types.Type.STRING)
+                },
+                required=["timestamp"],
+            ),
+        ),
+    )
+
+    result = json.loads(response.text)
+    return result["timestamp"]
+
+
+@app.post("/ask")
+def ask(request: AskRequest):
+    temp_file = None
+
+    try:
+        # 1️⃣ Download audio
+        temp_file = download_audio(request.video_url)
+
+        # 2️⃣ Upload to Gemini
+        uploaded_file = upload_audio_to_gemini(temp_file)
+
+        # 3️⃣ Ask Gemini
+        timestamp = find_timestamp(uploaded_file, request.topic)
 
         return {
-            "error": error_lines,
-            "result": execution["output"]
+            "timestamp": timestamp,
+            "video_url": request.video_url,
+            "topic": request.topic
         }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # 4️⃣ Cleanup
+        if temp_file and os.path.exists(temp_file):
+            os.remove(temp_file)
