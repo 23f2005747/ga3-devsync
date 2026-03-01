@@ -2,11 +2,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+from typing import List
+from io import StringIO
+import sys
+import traceback
 import os
 from dotenv import load_dotenv
 import json
 
+# Gemini
+from google import genai
+from google.genai import types
+
 load_dotenv()
+
+# ----------------------------
+# AI PIPE (Sentiment Analysis)
+# ----------------------------
 
 client = OpenAI(
     api_key=os.getenv("AI_PIPE_TOKEN"),
@@ -23,8 +35,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------
+# SENTIMENT ENDPOINT
+# ----------------------------
+
 class CommentRequest(BaseModel):
     comment: str
+
 
 @app.post("/comment")
 async def analyze_comment(request: CommentRequest):
@@ -51,3 +68,100 @@ async def analyze_comment(request: CommentRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ----------------------------
+# CODE INTERPRETER SECTION
+# ----------------------------
+
+class CodeRequest(BaseModel):
+    code: str
+
+
+class ErrorAnalysis(BaseModel):
+    error_lines: List[int]
+
+
+def execute_python_code(code: str) -> dict:
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
+
+    try:
+        exec(code)
+        output = sys.stdout.getvalue()
+        return {"success": True, "output": output}
+
+    except Exception:
+        output = traceback.format_exc()
+        return {"success": False, "output": output}
+
+    finally:
+        sys.stdout = old_stdout
+
+
+def analyze_error_with_ai(code: str, tb: str) -> List[int]:
+    try:
+        gemini_client = genai.Client(
+            api_key=os.getenv("GEMINI_API_KEY")
+        )
+
+        prompt = f"""
+Analyze this Python code and its error traceback.
+Identify the exact line number(s) where the error occurred.
+
+CODE:
+{code}
+
+TRACEBACK:
+{tb}
+
+Return only JSON like:
+{{ "error_lines": [line_numbers] }}
+"""
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "error_lines": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(type=types.Type.INTEGER),
+                        )
+                    },
+                    required=["error_lines"],
+                ),
+            ),
+        )
+
+        result = ErrorAnalysis.model_validate_json(response.text)
+        return result.error_lines
+
+    except Exception:
+        # fallback if AI fails
+        return []
+
+
+@app.post("/code-interpreter")
+def code_interpreter(request: CodeRequest):
+    execution = execute_python_code(request.code)
+
+    if execution["success"]:
+        return {
+            "error": [],
+            "result": execution["output"]
+        }
+
+    else:
+        error_lines = analyze_error_with_ai(
+            request.code,
+            execution["output"]
+        )
+
+        return {
+            "error": error_lines,
+            "result": execution["output"]
+        }
