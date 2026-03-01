@@ -129,16 +129,19 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 
 def get_transcript_text(video_id: str) -> str:
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    yt = YouTubeTranscriptApi()
+    transcript = yt.fetch(video_id)
+
+    # Convert to raw data list
+    transcript_list = transcript.to_raw_data()
 
     formatted = ""
-    for entry in transcript:
+    for entry in transcript_list:
         timestamp = seconds_to_hhmmss(entry["start"])
         text = entry["text"].replace("\n", " ")
         formatted += f"[{timestamp}] {text}\n"
 
     return formatted
-
 
 def ask_gemini_for_timestamp(transcript: str, topic: str) -> str:
 
